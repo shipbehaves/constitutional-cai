@@ -1,0 +1,14 @@
+[project]
+name = "constitutional-cai"
+version = "0.1.0"
+description = "Constitutional AI reproduction: self-critique and revision (SL-CAI) plus RLAIF via DPO, on small open models."
+requires-python = ">=3.11"
+dependencies = [
+    "torch",
+    "transformers",
+    "accelerate",
+    "datasets",
+]
+
+# uv resolves these and writes uv.lock (exact pins) for reproducibility.
+# Run the smoke with:  uv run python src/cai_smoke.py
