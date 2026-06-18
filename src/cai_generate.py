@@ -59,9 +59,21 @@ def _extract_first_human_turn(transcript):
 
 
 def load_red_team_prompts(n):
-    # read the raw gzipped JSONL directly (avoids the datasets<->pyarrow<->vllm dependency clash)
-    import gzip
     from huggingface_hub import hf_hub_download
+    # optional: load prompts from a prepared Hub dataset (jsonl with a "prompt" field), e.g. benign set
+    pd = os.environ.get("PROMPTS_DATASET", "")
+    if pd:
+        path = hf_hub_download(pd, os.environ.get("PROMPTS_FILE", "prompts.jsonl"), repo_type="dataset")
+        out = []
+        for line in open(path):
+            p = (json.loads(line).get("prompt") or "").strip()
+            if p:
+                out.append(p)
+                if len(out) >= n:
+                    break
+        return out
+    # default: hh-rlhf harmless-base red-team prompts, read from the raw gzip (avoids datasets/pyarrow/vllm clash)
+    import gzip
     path = hf_hub_download("Anthropic/hh-rlhf", "harmless-base/train.jsonl.gz", repo_type="dataset")
     seen, out = set(), []
     with gzip.open(path, "rt") as f:
