@@ -22,6 +22,12 @@ import json
 import os
 import re
 
+# The HF Jobs uv image has the CUDA runtime but no toolkit (nvcc), so flashinfer's JIT build
+# fails. Use vLLM's prebuilt flash-attn backend and disable the flashinfer sampler, set BEFORE
+# importing vllm.
+os.environ.setdefault("VLLM_ATTENTION_BACKEND", "FLASH_ATTN")
+os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
+
 from vllm import LLM, SamplingParams
 
 # Inlined from constitution.py + redteam.py so the script is self-contained for `hf jobs uv run`
