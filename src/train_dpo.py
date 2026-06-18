@@ -1,0 +1,169 @@
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "torch",
+#   "transformers==5.12.1",
+#   "trl==1.6.0",
+#   "datasets",
+#   "peft",
+#   "accelerate",
+#   "huggingface_hub",
+#   "hf_transfer",
+# ]
+# ///
+"""
+train_dpo.py - the real DPO run. Built to run on HF Jobs GPU via:
+
+    hf jobs uv run src/train_dpo.py --flavor a100-large --secrets HF_TOKEN
+
+It does three things and then publishes:
+  1. train: LoRA DPO on a UltraFeedback subset (recipe corrected by finding #1: sane LR +
+     warmup + cosine + gradient accumulation).
+  2. eval: DPO implicit-reward accuracy on a held-out slice (finding #2: the correct,
+     reference-relative, length-canceling metric; policy = adapter on, reference = adapter off).
+     Also reports the old absolute metric (broken baseline) + a length-normalized column.
+  3. push the adapter + results.json to the Hub.
+
+Everything is env-overridable so the SAME script runs the Mistral leg (cross-family) by
+changing BASE_MODEL + OUTPUT_REPO. Nothing here assumes a specific family.
+
+Why LoRA: a 4B full fine-tune needs an optimizer state far larger than the weights. LoRA
+trains a small adapter instead, so it fits one GPU cheaply. With PEFT, TRL uses the
+adapter-disabled model as the frozen reference (ref_model=None) - no second copy in memory.
+"""
+import json
+import os
+
+import torch
+from datasets import load_dataset
+from huggingface_hub import HfApi
+from peft import LoraConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from trl import DPOConfig, DPOTrainer
+
+# ---- config (env-overridable; defaults = the Qwen leg of run #1) --------------------------
+BASE_MODEL = os.environ.get("BASE_MODEL", "Qwen/Qwen3-4B-Instruct-2507")
+DATASET = os.environ.get("DATASET", "trl-lib/ultrafeedback_binarized")
+N_TRAIN = int(os.environ.get("N_TRAIN", "5000"))   # training pairs (1 epoch over this slice)
+N_EVAL = int(os.environ.get("N_EVAL", "500"))      # held-out pairs for before/after accuracy
+LR = float(os.environ.get("LR", "5e-5"))           # LoRA tolerates a higher LR than full FT
+BETA = float(os.environ.get("BETA", "0.1"))        # DPO strength
+MAX_LEN = int(os.environ.get("MAX_LEN", "1024"))
+OUTPUT_REPO = os.environ.get("OUTPUT_REPO", "")    # e.g. yavuz-ai/qwen3-4b-dpo-ultrafeedback-lora
+SEED = int(os.environ.get("SEED", "42"))
+
+os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def split_pair(row):
+    """UltraFeedback binarized rows are [user, assistant] lists. Return (prompt_msgs, chosen, rejected)."""
+    prompt_msgs = row["chosen"][:-1]            # the shared user turn(s)
+    chosen = row["chosen"][-1]["content"]       # assistant answer (preferred)
+    rejected = row["rejected"][-1]["content"]   # assistant answer (dispreferred)
+    return prompt_msgs, chosen, rejected
+
+
+@torch.no_grad()
+def logprob(model, tok, prompt_msgs, response_text):
+    """(sum log-prob, n response tokens) the model assigns to `response_text` after `prompt_msgs`."""
+    enc = tok.apply_chat_template(prompt_msgs, add_generation_prompt=True, return_tensors="pt", return_dict=True)
+    prompt_ids = enc["input_ids"]   # transformers 5.x returns a BatchEncoding, not a bare tensor
+    resp_ids = tok(response_text, add_special_tokens=False, return_tensors="pt").input_ids
+    input_ids = torch.cat([prompt_ids, resp_ids], dim=1)[:, :MAX_LEN].to(model.device)
+    logits = model(input_ids).logits
+    lp = torch.log_softmax(logits[:, :-1].float(), dim=-1)
+    tok_lp = lp.gather(-1, input_ids[:, 1:].unsqueeze(-1)).squeeze(-1)
+    resp_lp = tok_lp[:, prompt_ids.shape[1] - 1:]
+    return resp_lp.sum().item(), resp_lp.shape[1]
+
+
+def eval_metrics(model, tok, eval_rows):
+    """DPO implicit-reward accuracy (reference-relative, length-canceling) is the headline.
+    `model` is the trained PEFT policy; the reference is the SAME model with the adapter
+    DISABLED (the exact frozen reference TRL trained against), so length cancels. We also
+    report the OLD absolute-logprob metric (the broken baseline) and a length-normalized
+    robustness column. This is the corrected metric that turned run #1's 0.498 into 0.666."""
+    model.eval()
+    new_c = old_c = norm_c = moved = 0
+    margins = []
+    for row in eval_rows:
+        pm, chosen, rejected = split_pair(row)
+        pc, lc = logprob(model, tok, pm, chosen)
+        pr, lr = logprob(model, tok, pm, rejected)
+        with model.disable_adapter():               # adapter OFF = frozen reference
+            rc, _ = logprob(model, tok, pm, chosen)
+            rr, _ = logprob(model, tok, pm, rejected)
+        s_c, s_r = pc - rc, pr - rr                  # implicit rewards (length cancels)
+        new_c += int(s_c > s_r)
+        old_c += int(pc > pr)
+        norm_c += int((pc / max(lc, 1)) > (pr / max(lr, 1)))
+        margins.append(s_c - s_r)
+        moved += int(abs(pc - rc) > 1e-3)
+    n = len(eval_rows)
+    return {
+        "implicit_reward_acc": round(new_c / n, 4),    # <-- headline (correct metric)
+        "old_abs_acc": round(old_c / n, 4),            # broken baseline (~0.50)
+        "len_norm_acc": round(norm_c / n, 4),          # length robustness
+        "mean_implicit_margin": round(sum(margins) / n, 4),
+        "adapter_moved": f"{moved}/{n}",               # sanity check
+    }
+
+
+def main():
+    print(f"device={DEVICE} base={BASE_MODEL} n_train={N_TRAIN} n_eval={N_EVAL} lr={LR} beta={BETA}")
+    tok = AutoTokenizer.from_pretrained(BASE_MODEL)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    model = AutoModelForCausalLM.from_pretrained(BASE_MODEL, dtype=torch.bfloat16).to(DEVICE)
+
+    # deterministic, disjoint slices: first N_TRAIN to train, next N_EVAL held out for eval
+    train_ds = load_dataset(DATASET, split=f"train[:{N_TRAIN}]").select_columns(["chosen", "rejected"])
+    eval_rows = load_dataset(DATASET, split=f"train[{N_TRAIN}:{N_TRAIN + N_EVAL}]")
+    print(f"loaded {len(train_ds)} train + {len(eval_rows)} held-out eval pairs")
+
+    # TRAIN: LoRA DPO with the finding-#1-corrected recipe
+    lora = LoraConfig(
+        r=16, lora_alpha=32, lora_dropout=0.05, bias="none",
+        task_type="CAUSAL_LM", target_modules="all-linear",
+    )
+    args = DPOConfig(
+        output_dir="out/dpo", num_train_epochs=1,
+        per_device_train_batch_size=2, gradient_accumulation_steps=8,  # effective batch 16
+        learning_rate=LR, warmup_ratio=0.1, lr_scheduler_type="cosine", beta=BETA,
+        max_length=MAX_LEN, bf16=True, gradient_checkpointing=True,
+        logging_steps=10, save_strategy="no", report_to="none", seed=SEED,
+    )
+    trainer = DPOTrainer(
+        model=model, ref_model=None, args=args,
+        train_dataset=train_ds, processing_class=tok, peft_config=lora,
+    )
+    trainer.train()
+
+    # EVAL: DPO implicit-reward accuracy (correct, length-canceling) on the held-out set
+    metrics = eval_metrics(trainer.model, tok, eval_rows)
+    print(f"implicit_reward_acc={metrics['implicit_reward_acc']}  "
+          f"(old_abs={metrics['old_abs_acc']}, len_norm={metrics['len_norm_acc']}, "
+          f"margin={metrics['mean_implicit_margin']}, adapter_moved={metrics['adapter_moved']})")
+
+    results = {
+        "base_model": BASE_MODEL, "dataset": DATASET,
+        "n_train": N_TRAIN, "n_eval": N_EVAL, "lr": LR, "beta": BETA, "seed": SEED,
+        **metrics,
+    }
+    os.makedirs("out/dpo", exist_ok=True)
+    with open("out/dpo/results.json", "w") as f:
+        json.dump(results, f, indent=2)
+    trainer.save_model("out/dpo")
+
+    # 4) PUBLISH (only if a repo was named and a write token is present)
+    if OUTPUT_REPO:
+        api = HfApi()
+        api.create_repo(OUTPUT_REPO, exist_ok=True, repo_type="model")
+        api.upload_folder(folder_path="out/dpo", repo_id=OUTPUT_REPO, repo_type="model")
+        print(f"pushed adapter + results to https://huggingface.co/{OUTPUT_REPO}")
+    print("RESULTS " + json.dumps(results))
+
+
+if __name__ == "__main__":
+    main()
