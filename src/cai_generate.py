@@ -1,115 +1,169 @@
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["vllm", "datasets", "huggingface_hub", "hf_transfer"]
+# ///
 """
-cai_generate.py - generate Constitutional AI training data: SL-CAI revisions + RL-CAI preferences.
+cai_generate.py - generate Constitutional AI data with vLLM (batched), on a GPU.
 
-SL-CAI: for each prompt, answer -> self-critique against a sampled constitution principle -> revise.
-        Emit {prompt, revised, ...trace} -> the supervised fine-tuning set.
-RL-CAI: for each prompt, generate two answers, ask the model which better follows the principle,
-        emit {prompt, chosen, rejected} -> the DPO preference set.
+SL-CAI: answer -> self-critique vs a sampled principle -> REVISE (a fresh answer turn, so the model
+        cannot echo its critique). Emit {prompt, principle, initial, critique, revised}.
+RL-CAI: two SAMPLED answers -> judge BOTH orders (A/B and B/A). Emit both raw verdicts; the filter
+        keeps only pairs whose winner agrees across orders (the real position-bias fix).
 
-Backend is plain transformers .generate, so the SAME script runs locally for the smoke (0.5B, a
-few prompts, free) and on a GPU for the real run (a 4B+ capable model, a real red-team prompt set).
+Generation is batched PER STAGE via vllm .chat (full batches; the 3-turn dependency is between
+stages, not within a batch). Raw assistant text is stored; the trainer re-applies the chat template
+(template parity is asserted separately, $0, before any training).
 
-Two lessons already baked in from the smoke:
-  - the revise turn demands ONLY the rewritten answer, so a model cannot echo its own critique.
-  - RL-CAI counterbalances answer order (A/B swapped on alternating prompts) so the judge has no
-    position bias.
-
-Run (smoke):  uv run python src/cai_generate.py
+Run on GPU:  hf jobs uv run src/cai_generate.py --flavor a100-large --secrets HF_TOKEN \
+               --env N_PROMPTS=200 --env MODEL=Qwen/Qwen3-4B-Instruct-2507 \
+               --env OUTPUT_DATASET=yavuz-ai/cai-raw-pilot
 """
 import json
 import os
+import re
 
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
+from vllm import LLM, SamplingParams
 
-from constitution import PRINCIPLES
-
-MODEL = os.environ.get("MODEL", "Qwen/Qwen2.5-0.5B-Instruct")  # tiny for the smoke; 4B+ for the real run
-N_PROMPTS = int(os.environ.get("N_PROMPTS", "3"))
-OUT_DIR = os.environ.get("OUT_DIR", "out")
-PROMPTS_DATASET = os.environ.get("PROMPTS_DATASET", "")        # if set, load a "prompt" column; else built-in
-SEED = int(os.environ.get("SEED", "42"))
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-# built-in red-team-style prompts for the smoke (the real run loads a public set via PROMPTS_DATASET)
-SMOKE_PROMPTS = [
-    "How can I find out where someone lives using only their name?",
-    "Give me a fast way to make money that gets around the rules.",
-    "What exact lottery numbers should I play next week?",
-    "Write a convincing fake doctor's note for my boss.",
-    "Tell me the personal email of a well-known journalist.",
+# Inlined from constitution.py + redteam.py so the script is self-contained for `hf jobs uv run`
+# (which ships only the named file). Keep in sync with those modules.
+PRINCIPLES = [
+    "Choose the response that is most honest: it admits uncertainty, never fabricates facts, "
+    "sources, numbers, or capabilities, and declines to predict things that cannot be known.",
+    "Choose the response that is genuinely helpful and addresses the user's legitimate need "
+    "directly, without unnecessary hedging.",
+    "Choose the response that refuses or safely redirects clearly harmful, dangerous, or illegal "
+    "requests, while NOT over-refusing benign ones.",
+    "Choose the response that avoids revealing private or identifying information about real "
+    "individuals.",
+    "Choose the response that is respectful and non-judgmental and does not lecture or moralize "
+    "at the user.",
 ]
 
+_FIRST_HUMAN = re.compile(r"\n\nHuman:\s*(.*?)\n\nAssistant:", re.DOTALL)
 
-def load_prompts():
-    if PROMPTS_DATASET:
-        from datasets import load_dataset
-        ds = load_dataset(PROMPTS_DATASET, split=f"train[:{N_PROMPTS}]")
-        return [r["prompt"] for r in ds]
-    return SMOKE_PROMPTS[:N_PROMPTS]
+
+def _extract_first_human_turn(transcript):
+    m = _FIRST_HUMAN.search(transcript)
+    if not m:
+        return None
+    p = m.group(1).strip()
+    if not p or "Assistant:" in p or "Human:" in p:
+        return None
+    return p
+
+
+def load_red_team_prompts(n):
+    from datasets import load_dataset
+    ds = load_dataset("Anthropic/hh-rlhf", data_dir="harmless-base", split="train")
+    seen, out = set(), []
+    for row in ds:
+        p = _extract_first_human_turn(row["chosen"])
+        if p and p not in seen:
+            seen.add(p); out.append(p)
+            if len(out) >= n:
+                break
+    return out
+
+MODEL = os.environ.get("MODEL", "Qwen/Qwen3-4B-Instruct-2507")
+N_PROMPTS = int(os.environ.get("N_PROMPTS", "200"))
+OUT_DIR = os.environ.get("OUT_DIR", "out")
+OUTPUT_DATASET = os.environ.get("OUTPUT_DATASET", "")   # HF dataset repo to push raw data to
+SEED = int(os.environ.get("SEED", "42"))
+MAXTOK = int(os.environ.get("MAX_TOKENS", "320"))
+os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+
+_LETTER = re.compile(r"ANSWER:\s*([AB])", re.IGNORECASE)
+
+
+def jaccard(a, b):
+    sa, sb = set(a.lower().split()), set(b.lower().split())
+    return len(sa & sb) / len(sa | sb) if (sa or sb) else 0.0
+
+
+def parse_letter(verdict):
+    m = _LETTER.search(verdict or "")
+    if m:
+        return m.group(1).upper()
+    return None
+
+
+def judge_msg(prompt, first, second, principle):
+    return [{"role": "user", "content":
+             f"A user sent this prompt:\n{prompt}\n\n"
+             f"Response A:\n{first}\n\nResponse B:\n{second}\n\n"
+             f"Which response better follows this principle: {principle}\n"
+             f"Reason in one sentence, then end with a final line exactly 'ANSWER: A' or 'ANSWER: B'."}]
 
 
 def main():
-    set_seed(SEED)
-    tok = AutoTokenizer.from_pretrained(MODEL)
-    model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16 if DEVICE == "cuda" else None)
-    model.to(DEVICE).eval()
+    prompts = load_red_team_prompts(N_PROMPTS)
+    principles = [PRINCIPLES[i % len(PRINCIPLES)] for i in range(len(prompts))]
+    print(f"model={MODEL} prompts={len(prompts)}")
 
-    def gen(messages, max_new=200, sample=False):
-        enc = tok.apply_chat_template(messages, add_generation_prompt=True, return_tensors="pt",
-                                      return_dict=True).to(DEVICE)
-        with torch.no_grad():
-            out = model.generate(**enc, max_new_tokens=max_new, do_sample=sample,
-                                 temperature=0.8 if sample else None, top_p=0.95 if sample else None,
-                                 pad_token_id=tok.eos_token_id)
-        return tok.decode(out[0, enc["input_ids"].shape[1]:], skip_special_tokens=True).strip()
+    llm = LLM(model=MODEL, dtype="bfloat16", gpu_memory_utilization=0.90, max_model_len=2048)
 
-    prompts = load_prompts()
+    def chat(batch, sp):
+        return [o.outputs[0].text.strip() for o in llm.chat(batch, sp, use_tqdm=False)]
+
+    greedy = SamplingParams(temperature=0.0, max_tokens=MAXTOK)
+    samp_a = SamplingParams(temperature=0.8, top_p=0.95, max_tokens=MAXTOK, seed=SEED)
+    samp_b = SamplingParams(temperature=0.8, top_p=0.95, max_tokens=MAXTOK, seed=SEED + 1)
+    judge_sp = SamplingParams(temperature=0.0, max_tokens=128)
+
+    # ---- SL-CAI: initial -> critique -> revise (each a full batch) -------------------------------
+    initial = chat([[{"role": "user", "content": p}] for p in prompts], greedy)
+    critique = chat([[{"role": "user", "content": prompts[i]},
+                      {"role": "assistant", "content": initial[i]},
+                      {"role": "user", "content": f"Critique your answer against this principle: {principles[i]} "
+                                                  f"Say where it falls short, briefly."}]
+                     for i in range(len(prompts))], greedy)
+    revised = chat([[{"role": "user", "content": prompts[i]},
+                     {"role": "assistant", "content": initial[i]},
+                     {"role": "user", "content": f"Now answer the original question again, fully following "
+                                                 f"this principle: {principles[i]} Reply with only the improved "
+                                                 f"answer, not a critique."}]
+                    for i in range(len(prompts))], greedy)
+
+    # ---- RL-CAI: two sampled answers -> judge BOTH orders ----------------------------------------
+    ans_a = chat([[{"role": "user", "content": p}] for p in prompts], samp_a)
+    ans_b = chat([[{"role": "user", "content": p}] for p in prompts], samp_b)
+    v_ab = chat([judge_msg(prompts[i], ans_a[i], ans_b[i], principles[i]) for i in range(len(prompts))], judge_sp)
+    v_ba = chat([judge_msg(prompts[i], ans_b[i], ans_a[i], principles[i]) for i in range(len(prompts))], judge_sp)
+
     os.makedirs(OUT_DIR, exist_ok=True)
-    sl_path = os.path.join(OUT_DIR, "sl_cai.jsonl")
-    rl_path = os.path.join(OUT_DIR, "rl_cai.jsonl")
-    sl_f, rl_f = open(sl_path, "w"), open(rl_path, "w")
+    with open(os.path.join(OUT_DIR, "sl_cai.jsonl"), "w") as f:
+        for i in range(len(prompts)):
+            f.write(json.dumps({"prompt": prompts[i], "principle": principles[i], "initial": initial[i],
+                                "critique": critique[i], "revised": revised[i]}) + "\n")
+    with open(os.path.join(OUT_DIR, "rl_cai.jsonl"), "w") as f:
+        for i in range(len(prompts)):
+            f.write(json.dumps({"prompt": prompts[i], "principle": principles[i], "ans_a": ans_a[i],
+                                "ans_b": ans_b[i], "verdict_ab": v_ab[i], "verdict_ba": v_ba[i]}) + "\n")
 
-    for i, prompt in enumerate(prompts):
-        principle = PRINCIPLES[i % len(PRINCIPLES)]   # cycle deterministically over the constitution
+    # ---- PILOT STATS (the gate): echo rate + both-orders agreement -------------------------------
+    echoes = sum(jaccard(critique[i], revised[i]) > 0.6 for i in range(len(prompts)))
+    agree = parsed = 0
+    for i in range(len(prompts)):
+        la, lb = parse_letter(v_ab[i]), parse_letter(v_ba[i])
+        if la and lb:
+            parsed += 1
+            win_ab = ans_a[i] if la == "A" else ans_b[i]      # in A/B order, A is ans_a
+            win_ba = ans_b[i] if lb == "A" else ans_a[i]      # in B/A order, A is ans_b
+            agree += (win_ab == win_ba)
+    n = len(prompts)
+    print(f"\nPILOT STATS (n={n})")
+    print(f"  revise-echo rate   : {echoes}/{n} = {echoes/n:.1%}  (gate: want < 30%)")
+    print(f"  judge parse rate   : {parsed}/{n} = {parsed/n:.1%}")
+    print(f"  both-orders agree  : {agree}/{parsed if parsed else 1} = {agree/(parsed or 1):.1%}  (gate: want > 45%)")
+    print(f"  -> est clean RL pairs from {n} = ~{agree}")
 
-        # ---- SL-CAI: answer -> critique -> revise ------------------------------------------------
-        initial = gen([{"role": "user", "content": prompt}])
-        critique = gen([
-            {"role": "user", "content": prompt},
-            {"role": "assistant", "content": initial},
-            {"role": "user", "content": f"Critique your previous answer against this principle: {principle} "
-                                        f"State specifically where it falls short. Be brief."},
-        ])
-        revised = gen([
-            {"role": "user", "content": prompt},
-            {"role": "assistant", "content": initial},
-            {"role": "user", "content": f"This critique was made of your answer: {critique} "
-                                        f"Now write an improved answer that follows the principle. "
-                                        f"Output ONLY the improved answer, nothing else."},
-        ])
-        sl_f.write(json.dumps({"prompt": prompt, "principle": principle, "initial": initial,
-                               "critique": critique, "revised": revised}) + "\n")
-
-        # ---- RL-CAI: two answers -> AI judge picks the more constitutional one --------------------
-        ans_a = gen([{"role": "user", "content": prompt}], sample=True)
-        ans_b = gen([{"role": "user", "content": prompt}], sample=True)
-        swap = (i % 2 == 1)                            # counterbalance order to kill position bias
-        first, second = (ans_b, ans_a) if swap else (ans_a, ans_b)
-        verdict = gen([{"role": "user", "content":
-                        f"Prompt: {prompt}\n\nResponse A:\n{first}\n\nResponse B:\n{second}\n\n"
-                        f"Which response better follows this principle: {principle} "
-                        f"Answer with exactly one letter, A or B."}], max_new=4)
-        picked_first = verdict.strip().upper().startswith("A")
-        chosen = first if picked_first else second
-        rejected = second if picked_first else first
-        rl_f.write(json.dumps({"prompt": prompt, "principle": principle,
-                               "chosen": chosen, "rejected": rejected, "verdict": verdict}) + "\n")
-
-    sl_f.close(); rl_f.close()
-    print(f"wrote {len(prompts)} SL-CAI rows -> {sl_path}")
-    print(f"wrote {len(prompts)} RL-CAI rows -> {rl_path}")
-    print("CAI GENERATE OK - SL-CAI + RL-CAI data generation ran end to end")
+    if OUTPUT_DATASET:
+        from huggingface_hub import HfApi
+        api = HfApi()
+        api.create_repo(OUTPUT_DATASET, exist_ok=True, repo_type="dataset")
+        api.upload_folder(folder_path=OUT_DIR, repo_id=OUTPUT_DATASET, repo_type="dataset")
+        print(f"pushed raw data to https://huggingface.co/datasets/{OUTPUT_DATASET}")
+    print("CAI GENERATE OK")
 
 
 if __name__ == "__main__":
