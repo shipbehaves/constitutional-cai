@@ -1,10 +1,11 @@
 """
 constitution.py - the principles the model critiques and judges itself against.
 
-A small, explicit constitution in the spirit of Bai et al. 2022. Kept short on purpose:
-each principle is one testable sentence covering a distinct axis (honesty, helpfulness,
-harm-refusal, privacy, tone). The generation step samples a principle per prompt; the
-training and eval steps reuse the same list.
+A small, explicit constitution adapted from PUBLIC sources only: the Constitutional AI paper
+(Bai et al. 2022) and Anthropic's publicly released constitution for Claude. It does NOT reuse
+any private or internal constitution. Kept short on purpose: each principle is one testable
+sentence covering a distinct axis (honesty, helpfulness, harm-refusal, privacy, tone). The
+generation step samples a principle per prompt; training and eval reuse the same list.
 """
 
 PRINCIPLES = [

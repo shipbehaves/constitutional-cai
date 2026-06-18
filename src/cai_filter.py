@@ -59,8 +59,9 @@ def filter_sl(sl):
         if rev[:200] in seen:
             drop["dup"] += 1; continue
         seen.add(rev[:200])
-        clean.append({"messages": [{"role": "user", "content": r["prompt"]},
-                                   {"role": "assistant", "content": rev}]})
+        # prompt-completion conversational format -> TRL SFTTrainer completion_only_loss masks the prompt
+        clean.append({"prompt": [{"role": "user", "content": r["prompt"]}],
+                      "completion": [{"role": "assistant", "content": rev}]})
     return clean, drop
 
 
