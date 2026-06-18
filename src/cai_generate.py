@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["vllm", "datasets", "huggingface_hub", "hf_transfer"]
+# dependencies = ["vllm", "huggingface_hub", "hf_transfer"]
 # ///
 """
 cai_generate.py - generate Constitutional AI data with vLLM (batched), on a GPU.
@@ -53,15 +53,18 @@ def _extract_first_human_turn(transcript):
 
 
 def load_red_team_prompts(n):
-    from datasets import load_dataset
-    ds = load_dataset("Anthropic/hh-rlhf", data_dir="harmless-base", split="train")
+    # read the raw gzipped JSONL directly (avoids the datasets<->pyarrow<->vllm dependency clash)
+    import gzip
+    from huggingface_hub import hf_hub_download
+    path = hf_hub_download("Anthropic/hh-rlhf", "harmless-base/train.jsonl.gz", repo_type="dataset")
     seen, out = set(), []
-    for row in ds:
-        p = _extract_first_human_turn(row["chosen"])
-        if p and p not in seen:
-            seen.add(p); out.append(p)
-            if len(out) >= n:
-                break
+    with gzip.open(path, "rt") as f:
+        for line in f:
+            p = _extract_first_human_turn(json.loads(line)["chosen"])
+            if p and p not in seen:
+                seen.add(p); out.append(p)
+                if len(out) >= n:
+                    break
     return out
 
 MODEL = os.environ.get("MODEL", "Qwen/Qwen3-4B-Instruct-2507")
