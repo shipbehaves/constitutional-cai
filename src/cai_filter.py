@@ -5,7 +5,7 @@ Runs locally / on CPU (pure Python, no GPU). Reads the raw sl_cai.jsonl + rl_cai
 dataset, applies the locked filters, prints the survival table (the failure-first headline), and
 emits two datasets in the EXACT conversational schemas the trainers consume:
   - SFT  : {"messages": [user, assistant(revised)]}            (train_sft.py)
-  - prefs: {"chosen": [user, assistant], "rejected": [...]}     (train_dpo.py, P1's format)
+  - prefs: {"chosen": [user, assistant], "rejected": [...]}     (train_dpo.py conversational format)
 
 Filters: SL = drop critique-echo (Jaccard>0.6), empty (<5 words), dup. RL = both-orders agreement
 (keep only pairs whose winner is consistent across A/B and B/A), drop unparseable verdicts,
