@@ -13,7 +13,7 @@ its own feedback against a written constitution, with no human preference labels
 
 ## Plan (small steps)
 
-1. **smoke** (free, laptop): `uv run python src/cai_smoke.py` proves the critique-and-revise loop
+1. **smoke** (free, single 8 GB GPU, e.g. RTX 4070): `uv run python src/cai_smoke.py` proves the critique-and-revise loop
    end to end on a 0.5B model.
 2. **generation at scale**: produce critique/revision and preference data on a GPU (vLLM).
 3. **train**: SL-CAI SFT, then RL-CAI DPO, on a small open model.
